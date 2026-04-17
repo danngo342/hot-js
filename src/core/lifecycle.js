@@ -13,7 +13,10 @@ export function spawnProcess(entry) {
 
 export function restartProcess(entry, info) {
   if (info) {
-    log(`change detected in ${info.filename}`, "\x1b[33m");
+    log(
+      `restart triggered: ${info.reason} → ${info.filename}`,
+      "\x1b[33m"
+    );
   }
 
   if (child) {
