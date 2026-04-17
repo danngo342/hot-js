@@ -1,0 +1,29 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Output from hello.js test harness
+out.txt
+watched.txt
+
+# Logs
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor noise
+.vscode/
+.idea/
+
+# Build artifacts (if you ever add a build step)
+dist/
+build/
+
+# Hot.js runtime artifacts
+.hot/
+
