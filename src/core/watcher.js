@@ -1,31 +1,55 @@
 import fs from "fs";
 import path from "path";
-import { restartProcess } from "./lifecycle.js";
+import { log } from "../utils/logger.js";
 
-const IGNORE = new Set([
-  "node_modules",
-  ".git",
-  "out.txt",
-  ".DS_Store",
-]);
+export function startWatcher(entry, onRestart) {
+  const dir = path.dirname(entry);
 
-export function startWatcher(entry) {
-  let timer = null;
+  let timeout = null;
 
-  fs.watch(path.dirname(entry), { recursive: true }, (event, filename) => {
-    if (!filename) return;
+  function debouncedRestart(info) {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => onRestart(info), 50);
+  }
 
-    for (const ignore of IGNORE) {
-      if (filename.includes(ignore)) return;
+  const watcher = fs.watch(
+    dir,
+    { recursive: true },
+    (event, filename) => {
+      if (!filename) return;
+
+      const abs = path.join(dir, filename);
+
+      // Ignore the smoke test's output log file
+      if (filename.includes("output.log")) return;
+
+      // Ignore dotfiles and node_modules
+      if (filename.startsWith(".") || filename.includes("node_modules")) {
+        return;
+      }
+
+      const reason =
+        event === "rename"
+          ? "rename"
+          : event === "change"
+          ? "file-change"
+          : "unknown";
+
+      // Optional: comment out for cleaner logs
+      // if (reason !== "unknown") {
+      //   log(`watch event: ${event} → ${filename}`, "\x1b[90m");
+      // }
+
+      debouncedRestart({
+        event,
+        filename: abs,
+        reason,
+      });
     }
+  );
 
-    const reason = event === "change"
-      ? "file-change"
-      : event === "rename"
-      ? "rename"
-      : "unknown";
+  log(`watching directory: ${dir}`, "\x1b[90m");
 
-    debouncedRestart({ event, filename, reason });
-  });
+  return watcher;
 }
 

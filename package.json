@@ -1,0 +1,13 @@
+{
+  "name": "hotjs",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "hot": "./bin/hot.js"
+  },
+  "scripts": {
+    "test": "./scripts/test-hot.sh"
+  },
+  "license": "MIT"
+}
+

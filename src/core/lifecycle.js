@@ -1,12 +1,12 @@
-import { spawn } from 'child_process';
-import { log } from '../utils/logger.js';
+import { spawn } from "child_process";
+import { log } from "../utils/logger.js";
 
 let child = null;
 
 export function spawnProcess(entry) {
-  child = spawn('node', [entry], { stdio: 'inherit' });
+  child = spawn("node", [entry], { stdio: "inherit" });
 
-  child.on('exit', (code) => {
+  child.on("exit", (code) => {
     log(`process exited with code ${code}`, "\x1b[90m");
   });
 }
@@ -21,7 +21,7 @@ export function restartProcess(entry, info) {
 
   if (child) {
     log(`stopping child pid ${child.pid}`, "\x1b[90m");
-    child.kill('SIGTERM');
+    child.kill("SIGTERM");
   }
 
   spawnProcess(entry);
