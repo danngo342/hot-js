@@ -1,7 +1,7 @@
-hot.js Reload Lifecycle Specification
-Version 1.2
+# hot.js Reload Lifecycle Specification
+Version 1.2.1
 
-Version	1.2
+Version	1.2.1
 Date	2026-04-21
 Status	Canonical
 0. Preamble
@@ -20,6 +20,7 @@ In-flight cancellation classification and guarantees.
 Dependency-graph identity via SCC lexical keying.
 Immutability invariants across the entire pipeline.
 Integration-mode constraints (process supervisor, POSIX signal, WebSocket bridge).
+Snapshot semantics for userland state preservation.
 This specification does NOT govern: watcher implementation internals, filesystem polling strategy, or transport-layer encoding for the WebSocket bridge. Those belong to companion specifications.
 
 2. Terminology
@@ -43,6 +44,8 @@ Module Identity — The resolved, absolute, POSIX-normalized file path of a modu
 
 Quiescence — The state in which no reload cycle is active and no DETECT events are pending.
 
+Snapshot — A user-defined data structure for preserving state across reloads, captured in beforeReload and restored in afterReload or afterModuleReload.
+
 3. Lifecycle Phases
 A reload cycle consists of exactly eight ordered phases. Phases execute strictly sequentially — no phase overlaps with any other phase within the same cycle.
 
@@ -52,13 +55,13 @@ VALIDATE — The pipeline resolves the changed path against the dependency graph
 
 CANCEL_IN_FLIGHT — If an existing reload cycle is in-flight, the pipeline classifies the cancellation (see Section 8) and executes the classified cancellation protocol before proceeding. If no reload is in-flight, this phase is a no-op and completes in zero time.
 
-BEFORE_RELOAD — All registered beforeReload hooks fire in registration order. Each hook receives a frozen snapshot of the ReloadContext. If any hook throws or rejects, the cycle short-circuits to ERROR_BOUNDARY (see Section 7). Hook return values are collected into an ordered array and frozen before the next phase.
+BEFORE_RELOAD — All registered beforeReload hooks fire in registration order. Each hook receives a frozen snapshot of the ReloadContext. If any hook throws or rejects, the cycle short-circuits to ERROR_BOUNDARY (see Section 7). Hook return values are collected into an ordered array and frozen before the next phase. This phase is the deterministic moment for capturing snapshots.
 
 TEARDOWN — The pipeline invokes module-level teardown for every affected module in reverse-dependency order (dependents before dependencies). Teardown MUST be invoked even if the module has no explicit teardown hook — in that case, teardown is a no-op for that module. The purpose is to release resources, cancel subscriptions, and clear side effects. Teardown hooks receive a frozen per-module TeardownContext (a subset of ReloadContext scoped to the specific module).
 
 RELOAD — The pipeline invalidates and re-requires (or re-imports) every affected module. Module re-execution order follows the dependency graph in topological order (dependencies before dependents). Within an SCC, modules are re-executed in SCC Lexical Key order (see Section 5). If any module throws during re-execution, the error is captured and the cycle continues to ERROR_BOUNDARY with a partial-reload flag.
 
-AFTER_RELOAD — All registered afterReload hooks fire in registration order. Each hook receives a frozen snapshot of the updated ReloadContext (reflecting the new module state). If any hook throws or rejects, the error is captured but does NOT prevent the cycle from reaching SETTLE. Captured errors are appended to the ReloadContext error ledger.
+AFTER_RELOAD — All registered afterReload hooks fire in registration order. Each hook receives a frozen snapshot of the updated ReloadContext (reflecting the new module state). If any hook throws or rejects, the error is captured but does NOT prevent the cycle from reaching SETTLE. Captured errors are appended to the ReloadContext error ledger. This phase is the deterministic moment for restoring snapshots.
 
 SETTLE — The pipeline marks the cycle complete, clears in-flight state, and transitions to quiescence. No hooks fire during SETTLE. The final, fully frozen ReloadContext is emitted as the cycle's terminal artifact. After SETTLE, the ReloadContext MUST NOT be mutated by any code path.
 
@@ -146,7 +149,7 @@ Filesystem watchers, directory enumerators, and import/require resolution may re
 
 6. Hook Registration & Invocation
 6.1 Registration
-Hooks are registered via hot.on(phase, fn) where phase is one of: 'beforeReload', 'teardown', 'afterReload', 'onCancel'. Registration order is preserved. Duplicate registrations of the same function reference for the same phase are permitted and result in multiple invocations.
+Hooks are registered via hot.on(phase, fn) where phase is one of: 'beforeReload', 'teardown', 'afterReload', 'afterModuleReload', 'onCancel'. Registration order is preserved. Duplicate registrations of the same function reference for the same phase are permitted and result in multiple invocations.
 
 6.2 Invocation Order
 Hooks for a given phase fire in strict registration order (FIFO). This order is determined at registration time and MUST NOT be reordered by the pipeline at invocation time. If hooks are registered across multiple files, the registration order follows module execution order, which itself follows the dependency graph (and SCC Lexical Key order within SCCs).
@@ -158,12 +161,14 @@ Both sync and async hooks are permitted. Async hooks MUST be awaited before the 
 beforeReload hooks MAY return a value. Return values are collected in registration order into ReloadContext.hookResults and frozen (Object.freeze, shallow) before the TEARDOWN phase begins.
 teardown hooks MUST NOT return meaningful values. Any returned value is discarded.
 afterReload hooks MUST NOT return meaningful values. Any returned value is discarded.
+afterModuleReload hooks MUST NOT return meaningful values. Any returned value is discarded.
 onCancel hooks MUST NOT return meaningful values. Any returned value is discarded.
 6.5 Hook Error Behavior
-Phase	Error Behavior
+Phase/Error Behavior
 beforeReload	First error short-circuits remaining hooks. Cycle jumps to ERROR_BOUNDARY. Error recorded in ReloadContext.errors.
 teardown	Error is captured in ReloadContext.errors. Remaining modules continue teardown. Cycle does NOT short-circuit.
 afterReload	Error is captured in ReloadContext.errors. Remaining hooks continue. Cycle does NOT short-circuit.
+afterModuleReload	Error is captured in ReloadContext.errors. Remaining hooks continue. Cycle does NOT short-circuit.
 onCancel	Error is captured in the cancelling cycle's ReloadContext.errors. Remaining onCancel hooks continue.
 7. Error Semantics & Reserved Error-Key Namespace
 7.1 ReloadError Shape
@@ -202,6 +207,7 @@ hot:teardown:hook-error	TEARDOWN	A teardown hook threw or rejected.
 hot:reload:module-error	RELOAD	A module threw during re-execution.
 hot:reload:partial	RELOAD	Reload completed but one or more modules failed.
 hot:after:hook-error	AFTER_RELOAD	An afterReload hook threw or rejected.
+hot:afterModule:hook-error	AFTER_MODULE_RELOAD	An afterModuleReload hook threw or rejected.
 hot:context:mutation	Any	Illegal mutation of a frozen ReloadContext field detected.
 hot:context:currentModule-write	TEARDOWN / RELOAD	User code attempted to write to currentModule.
 7.3 User Error Keys
@@ -269,13 +275,27 @@ A hook invocation MUST NOT be interrupted mid-execution. Cancellation halts occu
 The onCancel hook phase is not a lifecycle phase — it is a cancellation-specific side channel. It does not appear in the eight-phase lifecycle.
 At most one cancellation classification occurs per DETECT event. If multiple DETECT events arrive simultaneously (within the debounce window), they are coalesced at the DETECT level before reaching CANCEL_IN_FLIGHT.
 Cancellation timeout is a configuration parameter (default: 5000ms). If onCancel hooks do not complete within the timeout, the pipeline emits hot:cancel:timeout and proceeds.
-9. Immutability Rules
+
+9. Snapshot Semantics
+9.1 Definition
+A snapshot is a user-defined data structure for preserving state across reloads. Snapshots are captured during the BEFORE_RELOAD phase and restored during the AFTER_RELOAD or AFTER_MODULE_RELOAD phases. Snapshots are opaque to hot.js and do not influence the reload pipeline.
+
+9.2 Lifecycle
+Snapshots are captured in beforeReload hooks and restored in afterReload or afterModuleReload hooks. The pipeline does not interpret, validate, or preserve snapshots.
+
+9.3 Invariants
+Snapshots do not affect reload ordering, dependency resolution, module replacement, lifecycle sequencing, or determinism guarantees. They are strictly userland.
+
+9.4 Hook Integration
+afterModuleReload hooks fire after each module's reload in the RELOAD phase, allowing per-module snapshot restoration.
+
+10. Immutability Rules
 This section consolidates every immutability invariant in the specification.
 
-9.1 Universal Freeze Protocol
+10.1 Universal Freeze Protocol
 All objects surfaced to user hooks — ReloadContext snapshots, TeardownContext, CancellationRecord, ReloadError entries, and hookResults — are shallow-frozen (Object.freeze) before delivery. User code MUST NOT attempt to defeat freezing via Proxy, prototype mutation, or defineProperty. Such attempts produce undefined behavior.
 
-9.2 Field-Level Immutability Schedule
+10.2 Field-Level Immutability Schedule
 Field	Writable During	Frozen At	Writer
 cycleId	Construction only	Construction	Pipeline
 detectedAt	Construction only	Construction	Pipeline
@@ -287,63 +307,67 @@ errors	VALIDATE through AFTER_RELOAD (append-only)	SETTLE	Pipeline
 cancellation	CANCEL_IN_FLIGHT	End of CANCEL_IN_FLIGHT	Pipeline
 integrationMode	Construction only	Construction	Pipeline
 userData	Any phase (user-writable)	SETTLE	User
-9.3 Snapshot Isolation
+10.3 Snapshot Isolation
 Hooks in BEFORE_RELOAD and AFTER_RELOAD receive frozen snapshots of the ReloadContext. A snapshot is a shallow clone with all fields frozen at the moment of snapshot creation. Mutations to the live ReloadContext (e.g., the pipeline updating currentModule during RELOAD) MUST NOT propagate to previously delivered snapshots.
 
-9.4 Post-SETTLE Immutability
+10.4 Post-SETTLE Immutability
 After SETTLE completes:
 
 The entire ReloadContext, including userData, is deeply frozen (recursive Object.freeze).
 No code path — pipeline or user — may mutate any field or nested object.
 The settled ReloadContext is the cycle's terminal artifact and MAY be retained for diagnostics, logging, or diffing against subsequent cycles.
-10. Integration Modes
+
+11. Integration Modes
 hot.js operates in exactly one of three integration modes per reload cycle. The mode is determined at startup and MUST NOT change during the process lifetime.
 
-10.1 Process Supervisor Mode
+11.1 Process Supervisor Mode
 The hot.js process is the parent supervisor. It spawns and manages the target process as a child. Reload triggers child restart via SIGTERM → wait → re-spawn. This mode provides the strongest isolation guarantees. The ReloadContext's integrationMode is 'supervisor'.
 
-10.2 POSIX Signal Mode
+11.2 POSIX Signal Mode
 hot.js sends a configurable POSIX signal (default: SIGHUP) to the target process. The target is responsible for handling the signal and reloading internally. hot.js does not manage the target's lifecycle. The ReloadContext's integrationMode is 'signal'.
 
-10.3 WebSocket Bridge Mode
+11.3 WebSocket Bridge Mode
 hot.js communicates reload events to the target via a WebSocket connection. The target runs a lightweight client that receives reload commands and executes module invalidation. This mode supports remote and browser-based targets. The ReloadContext's integrationMode is 'websocket'. The WebSocket protocol and message schema are defined in a companion specification.
 
-10.4 Mode Invariants
+11.4 Mode Invariants
 Integration mode is set once at process startup and recorded in every ReloadContext.
 The lifecycle phase ordering is identical across all three modes.
 The RELOAD phase implementation differs per mode (child restart vs. signal vs. message), but the phase's position in the lifecycle, its error semantics, and its interaction with other phases are mode-invariant.
 Hooks receive the same ReloadContext shape regardless of mode.
-11. Watcher Constraints
-11.1 Path Normalization
+
+12. Watcher Constraints
+12.1 Path Normalization
 All file paths entering the pipeline from the watcher MUST be:
 
 Absolute (no relative paths).
 POSIX-normalized (forward slashes, no trailing slash, no . or .. segments).
 Resolved against the real filesystem path (symlinks resolved to their targets).
-11.2 Debounce
+12.2 Debounce
 The watcher MUST debounce raw filesystem events. Multiple events for the same file within the debounce window (default: 100ms, configurable) collapse into a single DETECT. Multiple events for different files within the debounce window collapse into a single DETECT with all affected paths.
 
-11.3 Ignore Rules
+12.3 Ignore Rules
 Ignore patterns are applied at the watcher level, before DETECT. Ignored files MUST NOT enter the pipeline. Default ignores: node_modules/**, .git/**, *.swp, *.tmp, *~. Custom ignores are additive to defaults.
 
-12. Determinism Guarantees
+13. Determinism Guarantees
 This section summarizes the determinism contract.
 
 Given the same dependency graph, the same set of changed files, and the same registered hooks, the reload cycle MUST produce the same hook invocation order, the same module re-execution order, and the same ReloadContext shape on every run, on every platform, on every runtime.
 All sources of non-determinism — filesystem enumeration order, watcher event order, locale-dependent sorting, clock skew — are eliminated by the invariants in this specification (SCC Lexical Key, path normalization, debounce coalescence, monotonic timestamps).
 The only permitted source of variance is the content of user hook logic. The pipeline's behavior is fully determined by its inputs; user hooks may introduce side effects, but the pipeline does not observe or depend on those side effects (except thrown errors).
 If two reload cycles have identical inputs (same changed files, same graph, same hooks), their ReloadContexts MUST be structurally identical (deep equality) excluding timestamps and cycleId.
-13. Conformance
+
+14. Conformance
 An implementation conforms to this specification if and only if:
 
 All eight lifecycle phases execute in the specified order with no omissions.
-All immutability rules (Section 9) are enforced at runtime.
+All immutability rules (Section 10) are enforced at runtime.
 The SCC Lexical Key algorithm (Section 5) is implemented using byte-level POSIX sort.
 The reserved error-key namespace (Section 7.2) is enforced — user code cannot emit hot:-prefixed keys.
 In-flight cancellation is classified before action (Section 8).
 Hook invocation order matches registration order with no reordering (Section 6.2).
 The currentModule field follows the mutability model in Section 4.1 exactly.
-Path normalization (Section 11.1) is applied to every path before pipeline entry.
+Path normalization (Section 12.1) is applied to every path before pipeline entry.
+Snapshot semantics (Section 9) are implemented as specified.
 Non-conformance in any single rule constitutes full non-conformance. There are no conformance levels or profiles.
 
 — End of Specification —
