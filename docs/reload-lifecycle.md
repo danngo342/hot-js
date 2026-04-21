@@ -1,194 +1,105 @@
-# Reload Lifecycle Specification 1.3.0-rc1
+# Reload Lifecycle Specification — v1.4.0
 
-This document defines the normative reload lifecycle for the hot.js runtime: how module graphs are reloaded, evaluated, and committed with deterministic behavior and SCC‑level atomicity.
-
----
-
-# 1. Core Runtime Types
-
-## 1.1 ModuleId
-Opaque, unique identifier for a module within a graph.
-
-## 1.2 ModuleRecord
-Static description of a module.
-
-- **id:** `ModuleId`
-- **dependencies:** `ModuleId[]`
-- **evaluate:** `() => Promise<void> | void`  
-  Top‑level evaluation function.
-
-## 1.3 ModuleInstance
-Runtime instance of a ModuleRecord for a given reload.
-
-- **moduleId:** `ModuleId`
-- **record:** `ModuleRecord`
-- **version:** monotonic integer or token
-- **state:** `ModuleState`
-
-## 1.4 ModuleState
-Lifecycle state of a ModuleInstance.
-
-- `"unloaded"` — no instance exists yet
-- `"instantiated"` — instance created, evaluation not started
-- `"evaluating"` — evaluation in progress
-- `"evaluated"` — evaluation completed successfully
-- `"failed"` — evaluation threw or rejected
-
-**Normative transitions:**
-
-```
-unloaded → instantiated → evaluating → (evaluated | failed)
-```
+This document defines the normative reload lifecycle for the hot.js runtime.  
+Terminology used here is defined in **glossary v1.0.0**.  
+This document specifies **behavior**, not definitions.
 
 ---
 
-# 2. SCCs and Lexical Keys
+# 1. Overview
 
-## 2.1 Strongly Connected Components (SCCs)
-Given the module dependency graph:
+A reload consists of five phases:
 
-- Nodes: `ModuleId`
-- Edges: `A → B` if A depends on B
+1. **Plan** — compute reloadSCCs and the SCCGraph  
+2. **Instantiate** — create provisional ModuleInstances  
+3. **Prepare** — build the evaluation plan  
+4. **Evaluate** — evaluate SCCs in deterministic order  
+5. **Commit** — publish evaluated SCCs atomically  
 
-An SCC is a maximal set of modules mutually reachable.  
-Each SCC is an **atomic reload unit**.
-
-## 2.2 SCCGraph
-DAG formed by collapsing each SCC into a single node.
-
-- Nodes: SCCs
-- Edges: `S1 → S2` if any module in S1 depends on any module in S2
-
-This graph is acyclic and topologically sortable.
-
-## 2.3 Lexical Key
-Each SCC `S` has a **lexical key**:
-
-- Deterministic hash of a canonical serialization of:
-  - module membership
-  - internal edges
-- **Stable under version changes:**  
-  Depends only on graph structure, not ModuleInstance.version.
-- **Changes when structure changes.**
-- **Hash collisions:**  
-  Theoretically possible; treated as fatal graph errors.
+Reload behavior is defined at the SCC level.  
+No partial SCC commit is permitted.
 
 ---
 
-# 3. Dynamic Evaluation Context
+# 2. Inputs and Outputs
 
-## 3.1 `currentModule`
-A dynamic evaluation context:
+## 2.1 Inputs
 
-- **Type:** `ModuleInstance | null`
-- **Meaning:** the ModuleInstance whose `evaluate()` is currently executing
-- **Scope:** runtime context, not user code
+- `G_prev`: the previous committed module graph  
+- updated ModuleRecords  
+- reloadToken: unique identifier for this reload attempt  
 
-## 3.2 Invariant
-At all times:
+## 2.2 Outputs
 
-- If non‑null, `currentModule` **must** be the ModuleInstance currently being evaluated.
-- It is set before evaluation and restored afterward, even on error.
-
-## 3.3 Dynamic Context Pattern
-
-```ts
-const prev = currentModule;
-currentModule = inst;
-try {
-  // evaluation
-} finally {
-  currentModule = prev;
-}
-```
-
-Ensures correct:
-
-- error attribution  
-- cancellation scoping  
-- hook attribution  
-- async resume attribution  
-- nested evaluation semantics  
+- updated committed graph (if commit occurs)  
+- thrown ReloadError (if evaluation or commit fails)  
 
 ---
 
-# 4. Reload Phases
+# 3. Phase 1 — Plan
 
-## 4.1 Phase List
+The runtime computes:
 
-1. **Plan** — compute reload set and SCCGraph  
-2. **Instantiate** — create ModuleInstances  
-3. **Prepare** — build evaluation plan  
-4. **Evaluate** — evaluate SCCs  
-5. **Commit** — publish new instances
+1. **G_new** — the new dependency graph derived from updated ModuleRecords  
+2. **SCCs(G_new)** — strongly connected components  
+3. **SCCGraph** — DAG of SCCs  
+4. **reloadSCCs** — SCCs requiring reload  
+   - Determined by structural changes, ModuleRecord changes, or dependency changes  
 
-## 4.2 Phase ↔ Section Mapping
-
-- Phases 1–3 → §5  
-- Phase 4 → §6.3  
-- Phase 5 → §6.4  
+**Invariant:**  
+All modules in reloadSCCs MUST be reloaded.  
+No module outside reloadSCCs MAY be reloaded.
 
 ---
 
-# 5. Phases 1–3: Plan, Instantiate, Prepare
+# 4. Phase 2 — Instantiate
 
-## 5.1 Phase 1: Plan
+For each module in `reloadModules` (the union of modules in reloadSCCs):
 
-Given:
-
-- previous committed graph `G_prev`
-- new module records
-
-Compute:
-
-- new graph `G_new`
-- SCCs of `G_new`
-- SCCGraph (DAG)
-- **reload set** = SCCs requiring reload
-
-## 5.2 Phase 2: Instantiate
-
-For each module in the reload set:
-
-- create new ModuleInstance:
+- create a **provisional ModuleInstance**  
+- set:
+  - `moduleId = record.id`
+  - `record = ModuleRecord`
+  - `version = previous.version + 1` (or new token)
   - `state = "instantiated"`
 
-Instances are **provisional** until commit.
-
-## 5.3 Phase 3: Prepare
-
-- Topologically sort SCCGraph
-- Build ordered list of SCCs in reload set  
-  (this is the **evaluation plan**)
+Instances created here are **not yet committed**.
 
 ---
 
-# 6. Phases 4–5: Evaluate and Commit
+# 5. Phase 3 — Prepare
 
-# 6.1 Overview
-Phase 4 evaluates SCCs.  
-Phase 5 commits successfully evaluated SCCs.
+The runtime constructs the **evaluation plan**:
 
-# 6.2 SCC Atomicity
+1. Topologically sort the SCCGraph using **deterministic topological order**  
+2. Filter to SCCs in reloadSCCs  
+3. Produce a deterministic list of SCCs to evaluate  
 
-**Definition:**  
-**No partial SCC commit.**  
-Either all modules in an SCC commit, or none do.
+This ensures:
 
-Intermediate ModuleInstance states during evaluation are **not externally visible** if the SCC fails.
+- deterministic evaluation order  
+- deterministic commit order (for incremental commit)  
 
 ---
 
-# 6.3 Phase 4: `evaluateSCC`
+# 6. Phase 4 — Evaluate
 
-## 6.3.1 Algorithm
+Evaluation proceeds SCC‑by‑SCC in the order defined by the evaluation plan.
+
+## 6.1 SCC Atomicity (Evaluation Perspective)
+
+- Evaluation may produce intermediate ModuleInstance states  
+- These states are **not externally visible**  
+- Only commit makes results visible  
+
+## 6.2 `evaluateSCC` Algorithm
 
 Given:
 
-- `S`: SCC
-- `modules(S)`: modules in deterministic lexical order
-- `instances`: map `ModuleId → ModuleInstance`
-- `reloadToken`: unique token for this reload
+- `S`: an SCC  
+- `modules(S)`: modules in deterministic lexical order  
+- `instances`: map `ModuleId → ModuleInstance`  
+- `reloadToken`: reload identifier  
 
 ```ts
 async function evaluateSCC(S, instances, reloadToken) {
@@ -211,239 +122,150 @@ async function evaluateSCC(S, instances, reloadToken) {
       inst.state = "evaluated";
     } catch (e) {
       inst.state = "failed";
-
-      const err = classifyReloadError(
-        e,
-        reloadToken,
-        inst.moduleId,
-        S // SCC object
-      );
-
-      currentModule = prev;
+      const err = classifyReloadError(e, reloadToken, inst.moduleId, S);
       throw err;
+    } finally {
+      currentModule = prev;
     }
-
-    currentModule = prev;
   }
 }
 ```
 
-## 6.3.2 Invariants
+## 6.3 Evaluation Invariants
 
-- `currentModule` is always restored
-- If any module fails:
-  - `evaluateSCC` throws a ReloadError
-  - SCC is **not** committed
-- If all succeed:
-  - SCC is eligible for commit
+- `currentModule` MUST always be restored (even if classifyReloadError throws)  
+- If any module in `S` fails:
+  - `evaluateSCC` MUST throw a ReloadError  
+  - `S` MUST NOT be committed  
+- If all modules in `S` evaluate successfully:
+  - `S` becomes eligible for commit  
 
 ---
 
-# 6.4 Phase 5: Commit
+# 7. Phase 5 — Commit
 
-## 6.4.1 No Partial SCC Commit
+Commit publishes evaluated SCCs to the live graph.
 
-An SCC `S` commits **only if** all modules in `S` have `state = "evaluated"`.
+## 7.1 SCC Atomicity (Commit Perspective)
 
-If any module failed:
+**No partial SCC commit is permitted.**
 
-- `S` is not committed  
-- previous instances remain active
+An SCC `S` commits only if:
 
-## 6.4.2 Commit Strategies
+- all ModuleInstances in `S` have `state = "evaluated"`  
 
-### Strategy A: All‑at‑once
+If any ModuleInstance in `S` has `state = "failed"`:
 
-- All SCCs must evaluate successfully
-- Then commit entire graph
+- `S` MUST NOT commit  
+- previous instances remain active  
+
+## 7.2 Commit Strategies
+
+### Strategy A — All‑at‑once Commit
+
+- All SCCs must evaluate successfully  
+- Only then commit the entire new graph  
 - If any SCC fails:
-  - no SCC commits
+  - no SCC commits  
+  - `G_prev` remains active  
 
-### Strategy B: Incremental SCC Commit
+### Strategy B — Incremental SCC Commit
 
-- SCCs evaluated in topo order
+- SCCs commit individually in deterministic topological order  
 - After `evaluateSCC(S)` succeeds:
-  - commit `S` immediately
-- If later SCC fails:
-  - earlier committed SCCs remain committed
-  - reload fails for remaining SCCs
+  - commit `S` immediately  
+- If a later SCC fails:
+  - earlier committed SCCs remain committed  
+  - reload fails for remaining SCCs  
 
 **Invariant:**  
-Even with incremental commit, **no SCC is partially committed**.
-
-## 6.4.3 Binding
-
-- Phase 4 = §6.3  
-- Phase 5 = §6.4  
+Even under incremental commit, **no SCC is partially committed**.
 
 ---
 
-# 7. Errors and Classification
+# 8. Error Handling
 
-## 7.1 Error Categories
+## 8.1 Error Classification
 
-Top‑level categories:
+Errors are classified into canonical categories:
 
-- `"internal"`
-- `"user"`
-- `"graph"`
-- `"cancel"`
-- `"divergence"`
+- `"internal"`  
+- `"user"`  
+- `"graph"`  
+- `"cancel"`  
+- `"divergence"`  
 
-Names follow:
+Classification is performed by `classifyReloadError`.
 
-- `hot.reload.internal.*`
-- `hot.reload.user.*`
-- `hot.reload.graph.*`
-- `hot.reload.cancel.*`
-- `hot.reload.divergence.*`
+## 8.2 `classifyReloadError` Behavior
 
-## 7.2 ReloadError Shape
+- Maps raw errors to ReloadError  
+- Attaches:
+  - `reloadToken`  
+  - `moduleId`  
+  - `sccKey` (derived from SCC.lexicalKey)  
+- Ensures consistent error taxonomy  
 
-- **name:** string
-- **category:** one of the five categories
-- **reloadToken:** token for this reload
-- **moduleId?:** ModuleId
-- **sccKey?:** lexical key (`S.lexicalKey`)
-- **cause?:** original error
+## 8.3 Error Propagation
 
-## 7.3 `classifyReloadError`
-
-```ts
-function classifyReloadError(e, reloadToken, moduleId, scc) {
-  const sccKey = scc ? scc.lexicalKey : undefined;
-
-  if (isCancellationError(e)) {
-    return new ReloadError({
-      name: "hot.reload.cancel.requested",
-      category: "cancel",
-      reloadToken,
-      moduleId,
-      sccKey,
-      cause: e
-    });
-  }
-
-  if (isSccKeyCollisionError(e)) {
-    return new ReloadError({
-      name: "hot.reload.graph.scc-key-collision",
-      category: "graph",
-      reloadToken,
-      moduleId,
-      sccKey,
-      cause: e
-    });
-  }
-
-  if (isGraphDivergenceError(e)) {
-    return new ReloadError({
-      name: "hot.reload.divergence.graph-corruption",
-      category: "divergence",
-      reloadToken,
-      moduleId,
-      sccKey,
-      cause: e
-    });
-  }
-
-  if (isUserError(e)) {
-    return new ReloadError({
-      name: "hot.reload.user.module-evaluation-error",
-      category: "user",
-      reloadToken,
-      moduleId,
-      sccKey,
-      cause: e
-    });
-  }
-
-  return new ReloadError({
-    name: "hot.reload.internal.unexpected-state",
-    category: "internal",
-    reloadToken,
-    moduleId,
-    sccKey,
-    cause: e
-  });
-}
-```
-
-## 7.4 Definition: User Error
-
-A **user error** is:
-
-- any error thrown or rejection produced by user module code during evaluation,
-- that is not cancellation, graph error, divergence, or internal runtime error.
-
----
-
-# 8. Cancellation and Divergence
-
-## 8.1 Categories
-
-- **Cancellation** — explicit cancellation
-- **Failure** — user or graph errors
-- **Divergence** — corrupted or inconsistent graph
-- **Internal** — runtime bugs
-
-## 8.2 Mapping
-
-- User failures → `"user"`
-- Graph failures → `"graph"`
-- Cancellation → `"cancel"`
-- Divergence → `"divergence"`
-- Runtime bugs → `"internal"`
+- Any error during evaluation aborts the current SCC  
+- Commit behavior depends on commit strategy  
+- Divergence errors may require full restart  
 
 ---
 
 # 9. Invariants
 
-## 9.1 `currentModule`
-- always null or the ModuleInstance currently evaluating
-- always restored after evaluation
-- dynamic context, not user-visible
+The following invariants MUST hold:
 
-## 9.2 SCC Atomicity
-- no partial SCC commit
-- intermediate states not externally visible if SCC fails
+### 9.1 Dynamic Context Invariant
+`currentModule` MUST always be restored to its previous value.
 
-## 9.3 Graph Invariants
-- SCCGraph is always a DAG
-- lexical keys stable under version changes
-- SCC key collisions are fatal
+### 9.2 SCC Atomicity Invariant
+No partial SCC commit is permitted.
+
+### 9.3 Graph Invariants
+- SCCGraph MUST be a DAG  
+- lexical keys MUST be stable under version changes  
+- SCC key collisions MUST be treated as fatal  
+
+### 9.4 Reload Set Invariant
+reloadSCCs MUST determine exactly which modules are instantiated and evaluated.
 
 ---
 
-# 10. Previous Graph and Corruption
+# 10. Previous Graph and Divergence
 
 ## 10.1 Previous Graph (`G_prev`)
-The last fully committed graph **before** the reload began.
+The last fully committed graph before reload began.
 
-Used for:
+## 10.2 Divergence Detection
 
-- divergence detection
-- corruption checks
-- rollback semantics
+During reload:
 
-## 10.2 Incremental Commit and Previous Graph
+- committed SCCs update the **current graph**  
+- `G_prev` remains the reference for invariants  
+- divergence occurs when:
+  - the current graph violates invariants derived from `G_prev` or intended `G_new`  
 
-With incremental commit:
-
-- committed SCCs update the **current graph**
-- `G_prev` remains the pre‑reload snapshot
-- divergence checks compare:
-  - current graph (after partial commits)
-  - invariants derived from `G_prev` and intended `G_new`
-
-If corruption detected:
-
-- raise divergence error
-- runtime may require full restart or recovery
+Divergence MUST raise a `"divergence"` ReloadError.
 
 ---
 
-# 11. Step Numbering
+# 11. Document Structure and Numbering
 
-All steps in §5–§6 are contiguous and aligned with the phase list.  
-Any previous gaps (e.g., missing step 11) are removed.
+- This document uses section numbers, not “steps”  
+- Phase ordering is normative  
+- Section numbering is descriptive  
+- No guarantee is made about contiguous numbering across versions  
+
+---
+
+# 12. Versioning
+
+This document is versioned independently.
+
+- **v1.4.0** — glossary‑aligned, invariant‑aligned, corrected dynamic context restoration, corrected reload set semantics, deterministic topo order clarified  
+- Minor versions indicate semantic changes  
+- Patch versions indicate editorial changes  
 
