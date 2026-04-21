@@ -27,3 +27,4 @@ build/
 # Hot.js runtime artifacts
 .hot/
 
+.aider*
