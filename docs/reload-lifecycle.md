@@ -1,960 +1,615 @@
-# hot.js - Reload Lifecycle Specification
+# hot.js — Reload Lifecycle Specification
 
-<table>
-<tr>
-<td>Version:</td>
-<td>1.5.0</td>
-</tr>
-<tr>
-<td>Status:</td>
-<td>Normative Draft</td>
-</tr>
-<tr>
-<td>Date:</td>
-<td>2026-04-22</td>
-</tr>
-<tr>
-<td>License:</td>
-<td>MIT</td>
-</tr>
-</table>
+**Version:** 0.1.0  
+**Status:** Normative (Pre-MVP)
+**Doctrine:** Hookless Substrate  
+**Date:** 2026-04-22  
 
-This document defines the canonical reload lifecycle for the hot.js runtime. All
-normative requirements use RFC 2119 keywords (MUST, MUST NOT, SHALL,
-SHOULD, MAY). Informative notes are marked [Note].
+---
 
-## 2. Purpose and Scope
+## 1. Purpose & Scope
 
-hot.js is a minimal, deterministic reload substrate for JavaScript module graphs. It
-is a host-level orchestration tool and runtime orchestrator. hot.js is not a runtime
-owner - it does not replace, subsume, or compete with frontend HMR
-frameworks, server-side live-reload tools, or bundler-integrated hot-module
-systems.
+This document defines the **complete, deterministic reload lifecycle** for hot.js.
 
-hot.js defines boundaries and granularity so that the reload pipeline remains
-deterministic, transparent, and substrate-pure. Specifically, hot.js makes no
-assumptions about:
+hot.js is a **host-level runtime orchestrator** — it watches the filesystem, computes what changed, and restarts the affected module graph. It is not a bundler, not an HMR framework, and not a runtime owner. It owns exactly one thing: the reload.
 
-· How modules are structured or authored.
+This specification is the **single source of truth** for all reload behavior. Any implementation that contradicts this document is non-conformant.
 
-· How application state is organized, persisted, or migrated.
+### 1.1 What This Spec Governs
 
-· How UI rendering, server request handling, or any host environment
-operates.
+- The lifecycle state machine and its transitions.
+- The computation of ReloadSets from dependency graphs.
+- SCC-atomic reload, evaluation, commit, and rollback semantics.
+- Cancellation via supersession.
+- The error model and classification.
+- Integration mode contracts (Process Supervisor, Signal, WebSocket Bridge).
 
-· How event listeners, subscriptions, or timers are attached or cleaned up.
+### 1.2 What This Spec Does Not Govern
 
-· How caches, memoization stores, or derived data are invalidated.
+- UI state, framework state, or application state.
+- Bundler behavior, HMR protocols, or hydration.
+- Any runtime behavior inside the user's application.
 
-<!-- PageBreak -->
+---
 
-· How an application restores state, reinitializes subsystems, or handles
-reload side effects.
+## 2. Hookless Substrate Doctrine
 
-Scope: This specification covers the reload lifecycle only - the sequence of phases
-from trigger through completion. File watching, process spawning, signal
-handling, transport protocols, and integration modes are out of scope.
+**Hooks are permanently out of scope for hot.js.**
 
-## 3. Definitions (Normative Glossary)
+This is not a deferral. It is a closed architectural decision.
 
-The following terms are normative. All subsequent sections reference these
-definitions exclusively. Where a term appears in bold in the body of this
-specification, it carries the meaning defined here.
+### 2.1 Rationale
 
-Module - A single JavaScript source unit identified by a unique, stable
-ModuleId. A Module is the smallest unit of source tracked by the runtime.
+hot.js has exactly two goals:
 
-ModuleId - The unique, stable identifier for a Module. An opaque string, typically
-a resolved file path. Two Modules are identical if and only if their ModuleIds are
-identical. ModuleId comparison is byte-exact; no normalization is applied.
+1. Reload **deterministically**.
+2. Reload **quickly**.
 
-Dependency Graph (G) - A directed graph G = (V, E) where V is the set of all
-Modules and E is the set of import edges. Each directed edge (a, b) ∈ E means
-Module a statically imports Module b.
+Any feature that introduces user-defined execution points inside the reload pipeline — `beforeReload`, `afterReload`, `onModuleLoad`, `onError`, or any equivalent — is a **nondeterminism vector**. It violates Goal 1. If it blocks, it violates Goal 2.
 
-Strongly Connected Component (SCC) - A maximal set of Modules S ⊆ V such
-that every Module in S is reachable from every other Module in S via directed
-edges in G. A singleton Module with no self-edge forms a trivial SCC.
+### 2.2 The Five Zeroes
 
-SCCGraph - The directed acyclic graph (DAG) formed by collapsing each SCC in
-G into a single node. Edges in the SCCGraph represent inter-SCC dependencies.
-The SCCGraph is guaranteed acyclic by definition.
+| Zero | Meaning |
+|---|---|
+| Zero userland influence | No user code executes inside the reload pipeline. |
+| Zero nondeterminism vectors | No callbacks, no event emitters, no async interception points. |
+| Zero hidden dependencies | The reload depends only on the file change and the dependency graph. |
+| Zero global state | The pipeline carries no mutable state between reloads. |
+| Zero opinion | hot.js has no opinion about frameworks, renderers, state shape, or UI. |
 
-SCC Lexical Key - A deterministic, order-independent, implementation-
-independent structural fingerprint of an SCC. The construction algorithm is
-defined in Section 7.
+### 2.3 Consequence
 
-ReloadSet - The set of SCCs selected for reload in a given reload cycle. The
-ReloadSet is computed from the set of changed ModuleIds and their transitive dependents in the SCCGraph, walking forward (toward dependents), NOT
-backward (toward dependencies).
+The reload pipeline is a **pure function** of:
 
-Reload Cycle - A single, atomic pass through the reload lifecycle, triggered by
-one or more file-change events after debounce. A Reload Cycle proceeds through
-Phases 0–5 in strict sequential order.
+```
+Reload = f(ChangedFiles, DependencyGraph, Config)
+```
 
-Dynamic Context - A per-Module, per-reload-cycle object providing the Module
-with reload metadata. The exact shape is defined in Section 8.
+Nothing else enters. Nothing else influences. The pipeline is closed.
 
-currentModule - A field of the Dynamic Context. It is the ModuleId of the
-Module currently being evaluated during this reload phase. It is NOT the "entry
-module" or "changed module." It is always the Module whose evaluation is in
-progress.
+### 2.4 What Users Do Instead
 
-Hook - A user-defined function registered on a Module that the runtime invokes
-at a defined lifecycle phase. Hooks are optional, observational, and MUST NOT
-alter reload semantics.
+Users who need pre/post-reload behavior implement it **outside hot.js**, in their own process, using the integration modes defined in §11. hot.js emits structured Sig events (§3); consumers react to them. The boundary is absolute.
 
-Commit - The atomic act of replacing the previous module graph state with the
-newly evaluated state for an SCC. Commit is all-or-nothing per SCC.
+---
 
-Divergence - Any observable difference in behavior between two conforming
-implementations given identical inputs. The specification aims for zero divergence.
-See Section 11 for classification.
+## 3. Glossary
 
-Cancellation - The act of aborting a reload cycle before commit. Cancellation
-semantics are defined in Section 10.
+| Term | Definition |
+|---|---|
+| **Module** | A single JavaScript/TypeScript file identified by its resolved absolute path. The atomic unit of source. |
+| **SCC** | Strongly Connected Component. A maximal set of modules where every module is reachable from every other module via imports. The atomic unit of reload. |
+| **SCC Key** | A deterministic, lexicographically sorted, comma-joined string of the resolved absolute paths of all modules in the SCC. Immutable for a given graph topology. |
+| **Sig** | A structured, read-only signal emitted by hot.js at defined lifecycle transitions. Sigs are the sole external communication channel. They carry data; they accept no response. |
+| **ReloadSet** | The computed set of SCCs that must be reloaded in response to a set of file changes. Derived from the dependency graph. |
+| **Reload** | A single, atomic pass through the lifecycle state machine from `Triggered` to `Idle`. |
+| **Supersession** | The mechanism by which a newer Reload cancels an in-flight older Reload. |
+| **Epoch** | A monotonically increasing integer assigned to each Reload. Epochs are never reused. |
+| **Verdict** | The final classification of a completed Reload: `committed`, `rolled-back`, or `superseded`. |
+| **DependencyGraph** | A directed graph where nodes are Modules and edges are static import relationships, computed via AST extraction. |
+| **Quiescence** | The state in which no further changes are propagating and the system is idle. |
+| **Config** | The hot.js configuration, read once at startup. Immutable for the lifetime of the process. |
+
+---
 
 ## 4. Core Model
 
-### 4.1 Module Graph
+### 4.1 The Dependency Graph
 
-The runtime maintains a Dependency Graph G = (V, E) of all loaded Modules.
+The DependencyGraph is constructed by **static import extraction** (AST-level, not runtime). It is recomputed on every Reload.
 
-· G is constructed from static import declarations. Dynamic imports (e.g.,
-  `import()` expressions) are NOT part of G.
+- **Nodes** are Modules (resolved absolute paths).
+- **Edges** are static `import`/`require` declarations.
+- Dynamic imports (`import()`) are **excluded**. They are runtime constructs and cannot be statically determined.
 
-· G is immutable within a reload cycle. The graph is only updated between
-  reload cycles.
+### 4.2 SCC Decomposition
 
-· Every Module in V has a unique ModuleId. Duplicate ModuleIds are a
-  specification violation.
+The DependencyGraph is decomposed into SCCs using Tarjan's algorithm (or equivalent). The resulting **SCC DAG** (directed acyclic graph of SCCs) defines the reload order.
 
-### 4.2 Strongly Connected Components
+**Invariant:** The SCC DAG is always acyclic. If Tarjan's produces a cycle among SCCs, the implementation is non-conformant.
 
-The runtime decomposes G into its SCCs using Tarjan's algorithm or any
-equivalent algorithm that produces identical SCC membership.
+### 4.3 Topological Order
 
-· SCCs are the atomic reload units. Modules within an SCC MUST reload,
-  evaluate, commit, and fail together. There is no partial SCC reload.
+The SCC DAG is topologically sorted. SCCs are reloaded in **reverse topological order** — leaves first, roots last. This guarantees that when an SCC is evaluated, all of its dependencies have already been evaluated.
 
-· SCC membership is deterministic for a given G. Two implementations
-  operating on the same G MUST produce the same SCC decomposition.
+### 4.4 Epoch Assignment
 
-· A Module belongs to exactly one SCC.
+Each Reload is assigned a unique, monotonically increasing Epoch at the moment it enters `Triggered`. Epochs are unsigned 64-bit integers. Overflow is a fatal error.
 
-### 4.3 SCCGraph
+---
 
-The SCCGraph is the DAG formed by collapsing SCCs. It is guaranteed acyclic.
+## 5. Lifecycle State Machine
 
-· Reload order follows a valid topological order of the SCCGraph
-  (dependencies before dependents).
+A Reload passes through exactly these states, in exactly this order. There are no optional states, no conditional branches, and no loops.
 
-· If multiple valid topological orders exist, the runtime MUST use
-  lexicographic ordering of SCC Lexical Keys as the tiebreaker, producing a
-  single deterministic total order.
+```
+Idle → Triggered → Computing → Executing → Committing → Reporting → Idle
+                                    ↓             ↓
+                                 Failing → Reporting → Idle
+```
 
-· The topological sort with lexicographic tiebreaker MUST produce an
-  identical sequence across all conforming implementations for the same
-  SCCGraph.
+### 5.1 State Definitions
 
-### 4.4 SCC Lexical Keys
+#### `Idle`
 
-Each SCC has a Lexical Key computed by the algorithm defined in Section 7.
+The system is quiescent. No Reload is in progress. The watcher is active.
 
-· Lexical Keys are stable under version changes: same structure produces the
-  same key.
+- **Entry condition:** System startup, or previous Reload reached `Reporting → Idle`.
+- **Exit condition:** A file-change event is received from the watcher.
+- **Sig emitted:** None.
 
-· Lexical Keys change on structural changes: different imports produce
-  different keys.
+#### `Triggered`
 
-· Lexical Keys are used for: deterministic ordering tiebreaks, cache keying,
-  and identity across reload cycles.
+A file-change event has been received. The Reload is born.
 
-## 5. Reload Lifecycle Phases
+- **Entry condition:** Watcher delivers one or more changed file paths.
+- **Actions:**
+  1. Assign a new Epoch (previous Epoch + 1).
+  2. Record the set of changed file paths (the **trigger set**).
+  3. Start the debounce window (if configured). Additional file changes arriving within the debounce window are merged into the same trigger set. The Epoch does not change.
+- **Exit condition:** Debounce window closes (or no debounce configured).
+- **Sig emitted:** `sig:triggered { epoch, triggerSet }`.
 
-The lifecycle is a linear pipeline with no branching except error and cancellation
-exits. Phases execute in strict sequential order: 0 → 1 → 2 → 3 → 4 → 5.
+#### `Computing`
 
-### 5.0 Phase 0: Trigger
+The ReloadSet is being computed from the trigger set and the DependencyGraph.
 
-· One or more file-system change events are received.
+- **Entry condition:** `Triggered` completes.
+- **Actions:**
+  1. Re-extract the DependencyGraph from the current filesystem state via static AST analysis.
+  2. Decompose into SCCs (§6).
+  3. Compute the ReloadSet (§7).
+  4. Topologically sort the ReloadSet.
+- **Exit condition:** ReloadSet computation completes.
+- **Sig emitted:** `sig:computed { epoch, reloadSet, sccCount }`.
+- **Error transition:** If graph extraction fails (parse error, filesystem error), transition to `Failing`.
 
-· The runtime debounces events. The debounce window is implementation-
-  defined but MUST be documented.
+#### `Executing`
 
-· After debounce, the runtime computes the set of changed ModuleIds:
-  `changedSet`.
+Each SCC in the ReloadSet is being re-evaluated in topological order.
 
-· If `changedSet` is empty after debounce, no reload cycle is initiated.
+- **Entry condition:** `Computing` completes with a non-empty ReloadSet.
+- **Actions:**
+  1. For each SCC in the topologically sorted ReloadSet:
+     a. Invalidate all modules in the SCC from the module cache.
+     b. Re-evaluate all modules in the SCC. Evaluation order within an SCC is determined by the SCC Key sort order (lexicographic by resolved path).
+     c. If any module in the SCC throws during evaluation, the **entire SCC fails** (§6.3).
+  2. If the ReloadSet is empty, skip directly to `Committing`.
+- **Exit condition:** All SCCs in the ReloadSet have been evaluated without error.
+- **Error transition:** If any SCC fails evaluation, transition to `Failing`.
+- **Sig emitted:** `sig:scc-evaluated { epoch, sccKey }` after each successful SCC evaluation.
 
-### 5.1 Phase 1: Scope Resolution
+#### `Committing`
 
-· For each ModuleId in `changedSet`, find its containing SCC in the current
-  SCCGraph.
+The Reload is finalized. The new module state becomes the live state.
 
-· Compute the ReloadSet: the transitive closure of dependent SCCs in the
-  SCCGraph, starting from the SCCs containing changedSet members, walking
-  FORWARD (toward dependents).
+- **Entry condition:** `Executing` completes without error.
+- **Actions:**
+  1. The module cache now reflects the reloaded modules. No rollback is possible after this point.
+  2. Assign verdict: `committed`.
+- **Exit condition:** Commit completes.
+- **Sig emitted:** `sig:committed { epoch, verdict: "committed", reloadSet }`.
 
-· The ReloadSet includes the SCCs containing changedSet AND all
-  downstream SCCs.
+#### `Failing`
 
-## [Note]
+An error occurred during `Computing` or `Executing`. The Reload is being rolled back.
 
-The direction is forward (dependents), not backward (dependencies). A change
-in Module A causes A's SCC and all SCCs that depend on A's SCC to reload.
+- **Entry condition:** Error during `Computing` or `Executing`.
+- **Actions:**
+  1. Restore the module cache to its pre-Reload state for all SCCs that have not yet been committed. SCCs that were successfully evaluated but not yet committed are rolled back.
+  2. Record the error with its classification (§10).
+  3. Assign verdict: `rolled-back`.
+- **Exit condition:** Rollback completes.
+- **Sig emitted:** `sig:failed { epoch, verdict: "rolled-back", error }`.
 
-Dependencies of A are NOT reloaded.
+#### `Reporting`
 
-### 5.2 Phase 2: Order Determination
+Terminal bookkeeping state. The Reload's verdict is finalized and recorded.
 
-Sort the ReloadSet into a deterministic total order:
+- **Entry condition:** `Committing` or `Failing` completes.
+- **Actions:**
+  1. Emit the terminal Sig (either `sig:committed` or `sig:failed` was already emitted; `sig:report` is the final accounting Sig).
+  2. Clear all transient Reload state.
+  3. Return to `Idle`.
+- **Exit condition:** Immediate.
+- **Sig emitted:** `sig:report { epoch, verdict, durationMs }`.
 
-1. Primary: Valid topological order of the SCCGraph (dependencies before
-   dependents).
+### 5.2 State Transition Table
 
-2. Tiebreaker: Lexicographic comparison of SCC Lexical Keys (ascending).
+| From | To | Condition |
+|---|---|---|
+| `Idle` | `Triggered` | File-change event received. |
+| `Triggered` | `Computing` | Debounce window closes. |
+| `Computing` | `Executing` | ReloadSet computed successfully. |
+| `Computing` | `Failing` | Graph extraction or ReloadSet computation error. |
+| `Executing` | `Committing` | All SCCs evaluated successfully. |
+| `Executing` | `Failing` | Any SCC evaluation throws. |
+| `Committing` | `Reporting` | Commit completes. |
+| `Failing` | `Reporting` | Rollback completes. |
+| `Reporting` | `Idle` | Always. |
 
-This produces the ReloadQueue: an ordered list of SCCs to process. The
-ReloadQueue is immutable once computed. No hook, error, or runtime event MAY
-modify it.
+### 5.3 Prohibited Transitions
 
-### 5.3 Phase 3: Evaluation
+All transitions not listed in §5.2 are **illegal**. An implementation that permits any unlisted transition is non-conformant. There is no `Idle → Computing`, no `Executing → Triggered`, no `Failing → Executing`.
 
-For each SCC in the ReloadQueue, in order:
+---
 
-3. For each Module in the SCC (ordered lexicographically by ModuleId):
+## 6. SCC Semantics
 
-   1. Create a fresh Dynamic Context for this Module (see Section 8).
+SCCs are the **atomic unit of reload**. This is non-negotiable.
 
-   2. If the Module has registered a beforeReload hook, invoke it with the
-      Dynamic Context.
+### 6.1 SCC Identity
 
-   3. Evaluate the Module (execute its top-level code with the new source).
+An SCC is identified by its **SCC Key**: the lexicographically sorted, comma-joined resolved absolute paths of all modules in the SCC.
 
-   4. If evaluation throws, the SCC enters the Error state. Go to step 5 below.
+```
+SCC Key = sort(modules.map(m => m.resolvedPath)).join(",")
+```
 
-4. All Modules in the SCC have evaluated successfully.
+If the dependency graph changes such that an SCC's membership changes, its SCC Key changes. It is a **new SCC**. There is no SCC identity continuity across topology changes.
 
-5. Invoke afterEvaluate hooks for all Modules in the SCC (ordered lexicographically
-   by ModuleId), passing the Dynamic Context.
+### 6.2 SCC Atomicity
 
-6. Proceed to Phase 4 for this SCC.
+All modules in an SCC are:
 
-7. **[Error path]**: If any Module in the SCC throws during evaluation:
+- **Invalidated together.** You cannot invalidate a subset of an SCC's modules.
+- **Evaluated together.** All modules in the SCC are re-evaluated in a single pass.
+- **Committed together.** If the SCC succeeds, all modules are committed atomically.
+- **Rolled back together.** If any module in the SCC fails evaluation, all modules in the SCC are rolled back to their pre-Reload state.
 
-   - The entire SCC is marked as FAILED.
-   - No Modules in this SCC are committed.
-   - An error event is emitted with the appropriate error-key (see Section 9).
-   - The remaining SCCs in the ReloadQueue continue processing. SCC
-     failure does NOT cancel the reload cycle.
+There is no partial SCC reload.
 
-### 5.4 Phase 4: Commit
+### 6.3 SCC Failure Semantics
 
-For each SCC that completed Phase 3 successfully:
+If **any** module in an SCC throws during evaluation:
 
-8. Atomically replace the previous module bindings with the newly evaluated
-   bindings for all Modules in the SCC. This is all-or-nothing.
+1. The entire SCC is marked as failed.
+2. All modules in the SCC are rolled back.
+3. All **downstream SCCs** (SCCs that depend on this SCC) are **skipped**. They are not evaluated.
+4. The Reload transitions to `Failing`.
+5. The error is recorded with the SCC Key and the specific module that threw.
 
-9. Invoke afterCommit hooks for all Modules in the SCC (ordered
-   lexicographically by ModuleId), passing the Dynamic Context.
+### 6.4 Singleton SCCs
 
-10. The SCC is now in the COMMITTED state.
+A module with no circular dependencies forms a **singleton SCC** — an SCC containing exactly one module. Singleton SCCs obey all the same rules. There is no special case.
 
-Commit is irreversible. There is no rollback mechanism.
+---
 
-### 5.5 Phase 5: Completion
+## 7. ReloadSet Computation
 
-After all SCCs in the ReloadQueue have been processed (committed or failed):
+The ReloadSet is the set of SCCs that must be reloaded in response to a trigger set.
 
-    { reloadId, committedSCCs, failedSCCs, cancelledSCCs, duration }
+### 7.1 Algorithm
 
-## 6. Normative Reload Algorithm
+```
+Given: triggerSet (set of changed file paths), DependencyGraph
 
-The following pseudocode defines the canonical reload algorithm. All conforming
-implementations MUST produce behavior equivalent to this algorithm for all
-observable outputs.
+1. Resolve each path in triggerSet to its Module node in the DependencyGraph.
+   - If a path does not correspond to a known Module, it is ignored.
+   - If a path corresponds to a Module not in the current graph (new file),
+     re-extract the full DependencyGraph first.
 
-    // Phase 0: already complete (changedSet provided post-debounce)
+2. For each resolved Module, find its containing SCC.
+   → This produces the "directly affected SCCs."
 
-    FUNCTION reload (changedSet : Set<ModuleId>) -> ReloadResult:
+3. Compute the transitive closure of dependents in the SCC DAG:
+   - For each directly affected SCC, collect all SCCs that transitively
+     depend on it (upstream in the import direction, downstream in the
+     "affected by change" direction).
 
-        // Phase 1: Scope Resolution
-        LET affectedSCCs = {}
-        FOR EACH moduleId IN changedSet:
-            LET scc = findSCC(moduleId, currentGraph)
-            affectedSCCs.add(scc)
+4. The ReloadSet = directlyAffectedSCCs ∪ transitivelyAffectedSCCs.
 
-        LET reloadSet = transitiveForwardClosure(affectedSCCs, sccGraph)
+5. Topologically sort the ReloadSet (leaves first, roots last).
+```
 
-        // Phase 2: Order Determination
-        LET reloadQueue = topologicalSort(reloadSet, sccGraph)
-        // Tiebreak: lexicographic by SCC Lexical Key (ascending)
-        // reloadQueue is now a deterministic total order. Frozen.
+### 7.2 Empty ReloadSet
 
-        LET committed = []
-        LET failed = []
+If the trigger set resolves to zero known Modules (e.g., a non-imported file was saved), the ReloadSet is empty. The Reload transitions through `Executing` (no-op) and `Committing` with verdict `committed`. A `sig:report` is still emitted.
 
-        // Phase 3 + 4: Evaluate and Commit per SCC
-        FOR EACH SCC IN reloadQueue:
+### 7.3 Full Reload
 
-            // Cancellation checkpoint
-            IF cancellationRequested():
-                emit('cancel', { reloadId, errorKey: 'hot.cancel.superseded' })
-                RETURN { committed, failed, cancelled: remaining(reloadQueue) }
+If the ReloadSet equals the full set of SCCs in the DependencyGraph, this is a **full reload**. There is no special handling. The same algorithm applies. hot.js does not distinguish partial from full reloads architecturally.
 
-            LET evaluationSuccess = true
-            LET evaluatedModules = []
+### 7.4 ReloadSet Determinism
 
-            FOR EACH module IN lexicographicOrder(scc.modules):
-                LET ctx = createDynamicContext(module, reloadId, changedSet)
-                invokeHook(module, 'beforeReload', ctx)
+Given identical `triggerSet`, `DependencyGraph`, and `Config`, the ReloadSet computation **must** produce identical output. This is a hard invariant. Non-deterministic ReloadSet computation is a conformance failure.
 
-                TRY:
-                    evaluate(module)
-                    evaluatedModules.push(module)
-                CATCH error:
-                    evaluationSuccess = false
-                    emit('error', { scc, module, error, errorKey: classify(error) })
-                    BREAK // entire SCC fails
+---
 
-            IF evaluationSuccess:
-                FOR EACH module IN lexicographicOrder(scc.modules):
-                    invokeHook(module, 'afterEvaluate', ctx)
+## 8. Normative Reload Algorithm
 
-                commitSCC(scc, evaluatedModules) // Phase 4a: atomic replace
+This section defines the complete algorithm as a single linear sequence. All behavior described in §5–§7 is restated here in execution order for implementor clarity.
 
-                FOR EACH module IN lexicographicOrder(scc.modules):
-                    invokeHook(module, 'afterCommit', ctx)
+```
+RELOAD(triggerSet):
 
-                committed.push(scc)
-            ELSE:
-                failed.push(scc)
+  01. epoch ← previousEpoch + 1
+  02. EMIT sig:triggered { epoch, triggerSet }
+  
+  03. IF debounce is configured:
+  04.   WAIT debounce window; merge additional file changes into triggerSet
+  
+  05. graph ← EXTRACT_DEPENDENCY_GRAPH(filesystem)
+  06.   ON ERROR: GOTO 20
+  
+  07. sccs ← TARJAN(graph)
+  08. reloadSet ← COMPUTE_RELOAD_SET(triggerSet, graph, sccs)
+  09. sortedReloadSet ← TOPOLOGICAL_SORT(reloadSet)
+  10. EMIT sig:computed { epoch, reloadSet, sccCount }
+  
+  11. IF superseded(epoch):
+  12.   verdict ← "superseded"
+  13.   EMIT sig:report { epoch, verdict, durationMs }
+  14.   RETURN
+  
+  15. FOR EACH scc IN sortedReloadSet:
+  16.   INVALIDATE scc.modules FROM cache
+  17.   EVALUATE scc.modules IN lexicographic order
+  18.     ON ERROR: GOTO 20
+  19.   EMIT sig:scc-evaluated { epoch, scc.key }
+  
+      — Check supersession between SCCs —
+  19a. IF superseded(epoch):
+  19b.   ROLLBACK all invalidated-but-uncommitted SCCs
+  19c.   verdict ← "superseded"
+  19d.   EMIT sig:report { epoch, verdict, durationMs }
+  19e.   RETURN
+  
+  20. — Error path —
+  21.   ROLLBACK all invalidated-but-uncommitted SCCs
+  22.   verdict ← "rolled-back"
+  23.   EMIT sig:failed { epoch, verdict, error }
+  24.   EMIT sig:report { epoch, verdict, durationMs }
+  25.   RETURN
+  
+  26. — Success path —
+  27. COMMIT all evaluated SCCs to live cache
+  28. verdict ← "committed"
+  29. EMIT sig:committed { epoch, verdict, reloadSet }
+  30. EMIT sig:report { epoch, verdict, durationMs }
+  31. RETURN
+```
 
-        // Phase 5: Completion
-        emit('reloadComplete', { reloadId, committed, failed, duration })
-        RETURN { committed, failed }
+---
 
-## 7. SCC Lexical Key Algorithm
+## 9. Cancellation & Supersession
 
-The following algorithm computes the Lexical Key for a given SCC. This algorithm
-is normative. All conforming implementations MUST use this algorithm to produce
-identical keys.
+### 9.1 Supersession Rule
 
-FUNCTION computeLexicalKey(scc: SCC) -> string:
+If a new file-change event arrives while a Reload is in-flight (in any state other than `Idle`), the new event **supersedes** the current Reload.
 
-    LET entries = []
+- The current Reload is marked with verdict `superseded`.
+- All invalidated-but-uncommitted SCCs in the current Reload are **rolled back**.
+- The new Reload begins at `Triggered` with a new Epoch.
 
-    FOR EACH module IN scc.modules:
-        LET deps =
-            module.dependencies
-                .filter(dep => scc.contains(dep))   // only intra-SCC deps
-                .map(dep => dep.moduleId)
-                .sort()                             // lexicographic ascending
+### 9.2 Supersession Check Points
 
-        entries.push(module.moduleId + ' : ' + deps.join(', '))
+Supersession is checked at exactly two points:
 
-    entries.sort() // lexicographic ascending
+1. **After `Computing`, before `Executing` begins** (line 11 in §8).
+2. **Between SCC evaluations** during `Executing` (line 19a in §8).
 
-    LET canonical = entries.join(' ; ')
-    RETURN SHA256(canonical)
+Supersession is **not** checked mid-evaluation within a single SCC. SCC evaluation is atomic and uninterruptible.
 
-### Key properties:
+### 9.3 Supersession is Not Cancellation
 
-· Deterministic: The same SCC structure always produces the same key.
+Supersession is **structural**, not cooperative. There is no "cancel token," no abort signal, no graceful shutdown negotiation. The superseded Reload's remaining work is simply not performed. Already-evaluated-but-uncommitted SCCs are rolled back.
 
-· Order-independent: Input module iteration order does not affect the result.
+### 9.4 Supersession Sig
 
-· Implementation-independent: Any conforming implementation MUST
-  produce the same key for the same SCC structure.
+A superseded Reload emits:
 
-· Cycle-agnostic: Represents the set of Modules and their structural
-  relationships, not traversal paths.
+```
+sig:report { epoch, verdict: "superseded", durationMs }
+```
 
-· Purely structural: Derived only from ModuleIds and intra-SCC dependency
-  edges. Source content, timestamps, and metadata are excluded.
+No `sig:committed` or `sig:failed` is emitted for a superseded Reload.
 
-· Finite: No recursion or cycle walking. The algorithm iterates each Module
-  exactly once.
+### 9.5 Debounce Interaction
 
-· The hash algorithm MUST be SHA-256. Implementations MUST NOT
-  substitute other hash algorithms.
+If a new file change arrives during the debounce window of a `Triggered` Reload, it is **merged** into the existing trigger set. The Epoch does not change. This is coalescence, not supersession. Supersession only applies to changes arriving **after** the debounce window closes.
 
-· String encoding for the SHA-256 input MUST be UTF-8.
+---
 
-<!-- PageBreak -->
+## 10. Error Model
 
-## 8. Dynamic Context
+### 10.1 Error Classification
 
-The Dynamic Context is a per-Module, per-reload-cycle object provided to hooks
-and available during Module evaluation. Its shape is normative:
+All errors are classified into exactly one of these categories:
 
-DynamicContext {
+| Error Key | Phase | Description |
+|---|---|---|
+| `ERR_PARSE` | Computing | A module failed to parse (syntax error). |
+| `ERR_RESOLVE` | Computing | A module's import target could not be resolved. |
+| `ERR_FS` | Computing | Filesystem I/O error during graph extraction. |
+| `ERR_EVAL` | Executing | A module threw during evaluation. |
+| `ERR_CYCLE_DEGENERATE` | Computing | Tarjan's algorithm detected a degenerate graph structure (implementation guard). |
+| `ERR_INTERNAL` | Any | An error in hot.js itself, not attributable to user code or filesystem. |
 
-    currentModule: ModuleId,
-        // The ModuleId of the Module currently being evaluated
+### 10.2 Error Shape
 
-    reloadId: string,
-        // Unique, opaque identifier for this reload cycle
+All errors emitted via Sigs conform to this shape:
 
-    changedModules: Set<ModuleId>,
-        // The original set of changed ModuleIds that triggered this cycle
-
-    isFirstLoad: boolean,
-        // True if this Module has never been loaded before
-
-    previousError: Error | null,
-        // Error from this Module's last failed evaluation, or null
-
-    timestamp: number
-        // Timestamp (ms since epoch) when this reload cycle began
+```
+{
+  key:       string,       // One of the ERR_* keys above.
+  epoch:     number,       // The Epoch of the Reload that failed.
+  phase:     string,       // "computing" | "executing"
+  module:    string | null, // Resolved path of the module that caused the error, if applicable.
+  sccKey:    string | null, // SCC Key of the affected SCC, if applicable.
+  message:   string,       // Human-readable error message.
+  cause:     Error | null   // The underlying error object, if available.
 }
+```
 
-### Invariants:
-
-· currentModule MUST always equal the ModuleId of the Module whose
-  evaluation is currently in progress. It is NOT the entry module, NOT the first
-  changed module, NOT the "root" module. It changes with each Module
-  evaluation.
-
-· reloadId is unique per reload cycle. Two distinct reload cycles MUST have
-  distinct reloadIds. The format of reloadId is implementation-defined but
-  MUST be an opaque string.
-
-· changedModules is the original changedSet from Phase 0. It is immutable and
-  identical for all Modules in the same reload cycle.
-
-· isFirstLoad is true only on the Module's very first evaluation ever. All
-  subsequent reloads set it to false.
-
-· previousError is the error from the LAST failed evaluation of THIS Module,
-  not from any other Module or any other reload cycle. If the Module has
-  never failed, this is null.
-
-· The Dynamic Context object is frozen (Object.freeze or equivalent). User
-  code MUST NOT mutate it. The runtime MUST enforce immutability.
-
-## 9. Hook Contract
-
-### 9.1 Registered Hooks and Invocation Order
-
-<table>
-<tr>
-<th>Hook</th>
-<th>Invocation Point</th>
-<th>Order Within SCC</th>
-</tr>
-<tr>
-<td>beforeReload(ctx)</td>
-<td>Before Module evaluation</td>
-<td>Lexicographic by ModuleId</td>
-</tr>
-<tr>
-<td>afterEvaluate(ctx)</td>
-<td>After all Modules in the SCC have evaluated successfully</td>
-<td>Lexicographic by ModuleId</td>
-</tr>
-<tr>
-<td>afterCommit(ctx)</td>
-<td>After the SCC has been committed</td>
-<td>Lexicographic by ModuleId</td>
-</tr>
-</table>
-
-### 9.2 Hook Constraints (Normative)
-
-· Hooks MUST NOT throw.  
-  If a hook throws, the runtime MUST catch the error, emit a diagnostic event  
-  with error-key `hot.hook.error`, and continue the lifecycle.  
-  Hook errors MUST NOT affect reload semantics.
-
-· Hooks MUST NOT return values that affect the reload pipeline.  
-  Return values are ignored.
-
-· Hooks MUST NOT cancel reloads.
-
-· Hooks MUST NOT reorder Modules.
-
-· Hooks MUST NOT modify the Dependency Graph.
-
-· Hooks MUST NOT modify the Dynamic Context.
-
-· Hooks MUST NOT modify the ReloadQueue.
-
-· Hooks are optional.  
-  A Module with no hooks behaves identically to a Module with no-op hooks.
-
-· Hooks are synchronous.  
-  Async hooks are NOT supported.  
-  If a hook returns a Promise, the Promise is ignored.
-
-· Hooks are observational only.  
-  They exist for side effects (logging, metrics, cleanup, state migration)  
-  that do not alter determinism.
-
-<!-- PageBreak -->
-
-## 10. Error Classification
-
-Error keys use a dot-separated namespace: `hot.<category>.<specific>`.  
-The namespace is normative and closed.
-
-<table>
-<tr>
-<th>Error Key</th>
-<th>Description</th>
-</tr>
-<tr>
-<td>hot.eval.syntax</td>
-<td>Parse or syntax error during Module evaluation.</td>
-</tr>
-<tr>
-<td>hot.eval.runtime</td>
-<td>Runtime exception during Module evaluation.</td>
-</tr>
-<tr>
-<td>hot.eval.timeout</td>
-<td>Module evaluation exceeded the implementation-defined timeout.</td>
-</tr>
-<tr>
-<td>hot.graph.cycle</td>
-<td>[Reserved] A cycle was detected that could not form a valid SCC. This SHOULD NOT occur if the graph algorithm is correct.</td>
-</tr>
-<tr>
-<td>hot.graph.missing</td>
-<td>A ModuleId in the Dependency Graph could not be resolved.</td>
-</tr>
-<tr>
-<td>hot.commit.failed</td>
-<td>The atomic commit operation for an SCC failed.</td>
-</tr>
-<tr>
-<td>hot.hook.error</td>
-<td>A hook threw an exception. Diagnostic only; does not affect lifecycle.</td>
-</tr>
-<tr>
-<td>hot.cancel.superseded</td>
-<td>The reload cycle was cancelled because a newer trigger superseded it.</td>
-</tr>
-<tr>
-<td>hot.cancel.explicit</td>
-<td>The reload cycle was cancelled by an explicit runtime API call.</td>
-</tr>
-</table>
-
-### Error classification invariants:
-
-· Every error emitted by the runtime MUST have exactly one error key  
-  from the namespace above.
-
-· Error keys are strings.  
-  They MUST match the pattern: `hot\.[a-z]+\.[a-z]+`
-
-· The error-key namespace is closed.  
-  Implementations MUST NOT invent new error keys outside this namespace.
-
-· Error keys are classification labels, not error messages.  
-  The associated error object contains the human-readable message.
-
-## 11. Cancellation and Divergence
-
-### 11.1 Cancellation
-
-· A reload cycle MAY be cancelled if a new trigger arrives while the current
-  cycle is in progress.
-
-· Cancellation is checked ONLY between SCC processing boundaries  
-  (between iterations of the ReloadQueue loop).  
-  Cancellation MUST NOT interrupt Module evaluation mid-execution.
-
-· If cancelled, all uncommitted SCCs are discarded.  
-  Already-committed SCCs are NOT rolled back.
-
-· A cancellation event is emitted with error-key `hot.cancel.superseded` and
-  includes the reloadId of the cancelled cycle.
-
-· The new trigger starts a fresh reload cycle from Phase 0.
-
-### 11.2 Divergence Classification
-
-<table>
-<tr>
-<th>Class</th>
-<th>Severity</th>
-<th>Definition</th>
-<th>Status</th>
-</tr>
-<tr>
-<td>Class A</td>
-<td>Fatal</td>
-<td>Two conforming implementations produce different committed module states for the same input.</td>
-<td>MUST NOT occur. Indicates a specification violation.</td>
-</tr>
-<tr>
-<td>Class B</td>
-<td>Observable</td>
-<td>Two conforming implementations produce different non-committed observable behaviors (e.g., different hook invocation timing, different error message text).</td>
-<td>SHOULD be minimized. Tolerated for implementation-defined behaviors.</td>
-</tr>
-<tr>
-<td>Class C</td>
-<td>Cosmetic</td>
-<td>Differences in logging, formatting, or diagnostic output.</td>
-<td>Explicitly allowed.</td>
-</tr>
-</table>
-
-<!-- PageBreak -->
-
-## 12. Immutability Rules
-
-The following objects are frozen at the specified points.  
-Mutation after freezing is a specification violation.
-
-<table>
-<tr>
-<th>Object</th>
-<th>Frozen When</th>
-</tr>
-<tr>
-<td>Dependency Graph G</td>
-<td>Immutable within a reload cycle. Updated only between cycles.</td>
-</tr>
-<tr>
-<td>ReloadSet</td>
-<td>Immutable once computed (end of Phase 1).</td>
-</tr>
-<tr>
-<td>ReloadQueue</td>
-<td>Immutable once computed (end of Phase 2).</td>
-</tr>
-<tr>
-<td>Dynamic Context</td>
-<td>Frozen upon creation. User code and hooks MUST NOT mutate it.</td>
-</tr>
-<tr>
-<td>SCC membership</td>
-<td>Immutable within a reload cycle.</td>
-</tr>
-<tr>
-<td>SCC Lexical Keys</td>
-<td>Immutable within a reload cycle.</td>
-</tr>
-<tr>
-<td>changedModules (changedSet)</td>
-<td>Immutable for the lifetime of the reload cycle.</td>
-</tr>
-<tr>
-<td>Error-key namespace</td>
-<td>Immutable for the lifetime of a specification version.</td>
-</tr>
-</table>
-
-## 13. Contracts and Guarantees
-
-### 13.1 Runtime Guarantees to User Code
-
-11. Deterministic reload order:  
-    Given identical G and identical changedSet,  
-    the ReloadQueue is identical across all conforming implementations.
-
-12. Atomic SCC commit:  
-    A committed SCC has all its Modules' bindings updated.  
-    A failed SCC has none updated.
-
-13. Isolation:  
-    SCC failure does not prevent other SCCs from committing.
-
-14. Hook safety:  
-    Hook errors never affect reload semantics.
-
-15. Context accuracy:  
-    currentModule always reflects the Module currently being evaluated.
-
-16. Immutable context:  
-    The Dynamic Context cannot be corrupted by user code.
-
-17. Cancellation safety:  
-    Already-committed SCCs survive cancellation.
-
-### 13.2 User Code Obligations to the Runtime
-
-18. Hooks MUST be synchronous and MUST NOT throw.
-
-19. User code MUST NOT depend on hook return values.
-
-20. User code MUST NOT mutate the Dynamic Context.
-
-21. User code MUST NOT depend on evaluation order within an SCC  
-    being anything other than lexicographic by ModuleId.
-
-## 14. Conformance
-
-· A conforming implementation MUST implement all normative requirements  
-  (MUST, MUST NOT, SHALL).
-
-· A conforming implementation SHOULD implement all recommended  
-  requirements (SHOULD).
-
-· A conforming implementation MAY implement optional features (MAY).
-
-· Implementation-defined behaviors MUST be documented in the  
-  implementation's public specification or documentation.
-
-· The implementation MUST use SHA-256 for SCC Lexical Key hashing.
-
-· The implementation MUST produce zero Class A divergence  
-  against the reference implementation.
-
-· An implementation claiming conformance MUST identify the  
-  specification version it conforms to.
-
-<!-- PageBreak -->
-
-## 15. Versioning Notes
-
-<table>
-<tr>
-<td>Version:</td>
-<td>1.5.0</td>
-</tr>
-<tr>
-<td>Previous versions:</td>
-<td>1.0.0, 1.2.2, 1.4.1</td>
-</tr>
-</table>
-
-### Changes from v1.4.1:
-
-· Pass 3 repairs applied: resolved all contradictions in SCC ordering,  
-  cancellation bookkeeping, error-key conventions, currentModule semantics,  
-  and ReloadSet interpretation.
-
-· Clarified that ReloadSet walks FORWARD (toward dependents),  
-  not backward (toward dependencies).
-
-· Clarified that currentModule is ALWAYS the Module currently being  
-  evaluated, not the entry or changed module.
-
-· Unified SCC Lexical Key algorithm with explicit intra-SCC dependency filtering.
-
-· Closed the error-key namespace — implementations MUST NOT extend it.
-
-· Added cancellation checkpoint semantics (between SCC boundaries only).
-
-· Added divergence classification (Class A/B/C).
-
-· Added conformance section.
-
-· Immutability rules consolidated into a single normative section.
-
-· Hook contract strengthened: hooks are explicitly synchronous,  
-  observational, and side-effect-only.
-
-## Appendix A: Invariant Summary Table
-
-<table>
-<tr>
-<th>ID</th>
-<th>Invariant</th>
-<th>Section</th>
-<th>Classification</th>
-</tr>
-
-<tr>
-<td>INV-01</td>
-<td>currentModule MUST equal the ModuleId of the Module whose evaluation is currently in progress.</td>
-<td>§8</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-02</td>
-<td>reloadId MUST be unique across all reload cycles.</td>
-<td>§8</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-03</td>
-<td>changedModules MUST be immutable and identical for all Modules in the same reload cycle.</td>
-<td>§8, §12</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-04</td>
-<td>The Dynamic Context MUST be frozen upon creation. Mutation attempts MUST be rejected.</td>
-<td>§8, §12</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-05</td>
-<td>Commit is atomic per SCC: all Modules' bindings are updated, or none are.</td>
-<td>§5.4</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-06</td>
-<td>No partial SCC reload: all Modules in an SCC MUST reload, evaluate, commit, and fail together.</td>
-<td>§4.2</td>
-<td>Structural</td>
-</tr>
-</table>
-
-<!-- PageBreak -->
-
-<table>
-<tr>
-<th>ID</th>
-<th>Invariant</th>
-<th>Section</th>
-<th>Classification</th>
-</tr>
-
-<tr>
-<td>INV-07</td>
-<td>SCC membership is deterministic for a given G and immutable within a reload cycle.</td>
-<td>§4.2, §12</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-08</td>
-<td>The SCCGraph is guaranteed acyclic (DAG).</td>
-<td>§4.3</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-09</td>
-<td>G is immutable within a reload cycle; updated only between cycles.</td>
-<td>§4.1, §12</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-10</td>
-<td>SCC Lexical Keys are stable under version changes (same structure → same key).</td>
-<td>§4.4, §7</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-11</td>
-<td>ReloadSet walks FORWARD (toward dependents), never backward (toward dependencies).</td>
-<td>§5.1</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-12</td>
-<td>The ReloadSet is immutable once computed (end of Phase 1).</td>
-<td>§5.1, §12</td>
-<td>Structural</td>
-</tr>
-
-<tr>
-<td>INV-13</td>
-<td>The ReloadQueue is immutable once computed and represents a deterministic total order.</td>
-<td>§5.2, §12</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-14</td>
-<td>Every error emitted MUST have exactly one error key from the closed namespace.</td>
-<td>§10</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-15</td>
-<td>The error-key namespace is closed. Implementations MUST NOT extend it.</td>
-<td>§10</td>
-<td>Structural</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<th>ID</th>
-<th>Invariant</th>
-<th>Section</th>
-<th>Classification</th>
-</tr>
-
-<tr>
-<td>INV-16</td>
-<td>Class A divergence (different committed states for same input) is a specification violation.</td>
-<td>§11.2</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-17</td>
-<td>Same G + same changedSet MUST produce same ReloadQueue across all conforming implementations.</td>
-<td>§13.1</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-18</td>
-<td>Tiebreaker for topological sort MUST be lexicographic comparison of SCC Lexical Keys (ascending).</td>
-<td>§4.3, §5.2</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-19</td>
-<td>Hook errors MUST NOT affect reload semantics. The runtime MUST catch and emit diagnostics.</td>
-<td>§9</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-20</td>
-<td>Hooks are synchronous. Async hooks (Promises) are ignored.</td>
-<td>§9</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-21</td>
-<td>Cancellation is checked ONLY between SCC boundaries. Mid-evaluation cancellation is prohibited.</td>
-<td>§11.1</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-22</td>
-<td>Already-committed SCCs survive cancellation. Commit is irreversible.</td>
-<td>§5.4, §11.1</td>
-<td>Behavioral</td>
-</tr>
-
-<tr>
-<td>INV-23</td>
-<td>SCC Lexical Key hash algorithm MUST be SHA-256. No substitutions.</td>
-<td>§7</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-24</td>
-<td>Module evaluation order within an SCC MUST be lexicographic by ModuleId.</td>
-<td>§5.3</td>
-<td>Determinism</td>
-</tr>
-
-<tr>
-<td>INV-25</td>
-<td>isFirstLoad is true only on a Module's very first evaluation. All reloads set it to false.</td>
-<td>§8</td>
-<td>Behavioral</td>
-</tr>
-</table>
-
-\- End of Specification -
+### 10.3 Error Recovery
+
+hot.js does **not** implement automatic retry. A failed Reload returns to `Idle`. The next file-change event triggers a new Reload, which may succeed if the error has been fixed.
+
+There is no error memory. Each Reload starts clean. A module that failed in Epoch N has no penalty, flag, or special treatment in Epoch N+1.
+
+### 10.4 Fatal Errors
+
+The following errors are **fatal** — hot.js terminates the process:
+
+- Epoch overflow (unsigned 64-bit integer exceeded).
+- `ERR_INTERNAL` occurring three times consecutively without a successful Reload between them.
+- Watcher subsystem failure (underlying `fs.watch` or equivalent becomes unrecoverable).
+
+All other errors are **recoverable** and result in a `rolled-back` verdict.
+
+---
+
+## 11. Integration Modes
+
+hot.js exposes three integration modes. All three are **external** — they consume Sigs from outside the reload pipeline. None of them inject behavior into the pipeline.
+
+### 11.1 Process Supervisor Mode
+
+hot.js spawns and owns the user's process as a child process.
+
+- On `sig:committed`: hot.js sends `SIGTERM` to the child, waits for exit (with configurable timeout), then respawns.
+- On `sig:failed`: hot.js logs the error. The child continues running with the previous module state.
+- On `sig:report { verdict: "superseded" }`: No action. The superseding Reload will handle the restart.
+
+This is the **default mode**.
+
+### 11.2 POSIX Signal Mode
+
+hot.js sends a configurable POSIX signal (default: `SIGUSR2`) to a target PID.
+
+- On `sig:committed`: hot.js sends the configured signal to the target PID.
+- The target process is responsible for handling the signal and reloading itself.
+- hot.js does not own, spawn, or manage the target process.
+
+### 11.3 WebSocket Bridge Mode
+
+hot.js exposes a local WebSocket server that forwards Sigs as JSON messages.
+
+- On any Sig emission, the corresponding Sig payload is serialized to JSON and broadcast to all connected WebSocket clients.
+- Clients may be dev servers, browser extensions, or custom tooling.
+- The WebSocket bridge is **read-only**. Clients cannot send commands to hot.js. The bridge accepts no inbound messages.
+- The bridge binds to `localhost` only. It is not exposed to the network.
+
+### 11.4 Mode Exclusivity
+
+Modes are **not exclusive**. An implementation MAY support running multiple modes simultaneously (e.g., Process Supervisor + WebSocket Bridge). The modes are orthogonal; they do not interact.
+
+---
+
+## 12. Invariants
+
+These invariants hold for every Reload, unconditionally. Violating any of them is a conformance failure.
+
+### 12.1 Determinism Invariant
+
+> Given identical `triggerSet`, `DependencyGraph`, and `Config`, the Reload produces identical `ReloadSet`, identical evaluation order, and identical `verdict` (absent non-determinism in user module evaluation).
+
+### 12.2 Atomicity Invariant
+
+> An SCC is the atomic unit of reload. There is no partial SCC invalidation, evaluation, commit, or rollback.
+
+### 12.3 Purity Invariant
+
+> The reload pipeline is a pure function of `(ChangedFiles, DependencyGraph, Config)`. No user code, no callbacks, no hooks, no event handlers, and no external state influence the pipeline.
+
+### 12.4 Monotonic Epoch Invariant
+
+> Epochs are monotonically increasing unsigned integers. A Reload with Epoch N always started before a Reload with Epoch N+1. Epochs are never reused, never decremented, never reset.
+
+### 12.5 Quiescence Invariant
+
+> If no file-change events arrive, the system reaches `Idle` in finite time and remains there. The system never self-triggers.
+
+### 12.6 Supersession Invariant
+
+> A superseded Reload never commits. Its evaluated-but-uncommitted SCCs are always rolled back before the superseding Reload begins `Computing`.
+
+### 12.7 Order Invariant
+
+> SCCs in the ReloadSet are evaluated in reverse topological order of the SCC DAG. When an SCC is evaluated, all SCCs it depends on have already been evaluated in this Reload (or were not in the ReloadSet and are therefore unchanged).
+
+### 12.8 No-Opinion Invariant
+
+> hot.js carries no assumptions about the semantics of the modules it reloads. It does not know or care about React, Vue, Svelte, Express, state, UI, DOM, SSR, hydration, or any other framework or runtime concept.
+
+---
+
+## 13. Contracts & Guarantees
+
+### 13.1 To the User
+
+- **Deterministic behavior.** Same input, same output.
+- **No side-channel influence.** Nothing outside `(ChangedFiles, DependencyGraph, Config)` affects the Reload.
+- **Atomic failure.** If a Reload fails, the previous working state is fully restored.
+- **Structured observability.** All lifecycle transitions are observable via Sigs.
+- **No magic.** No auto-wiring, no decorators, no hidden behavior.
+
+### 13.2 To the Implementation
+
+- **Config is immutable.** Read once at startup. Changes to config require a process restart.
+- **Sigs are fire-and-forget.** Emitting a Sig is non-blocking. If no consumer is listening, the Sig is discarded. Sigs never block the pipeline.
+- **Rollback must be total.** A partial rollback (some modules rolled back, others not) is a conformance failure.
+- **The watcher is the sole trigger.** No internal mechanism, timer, or heuristic may trigger a Reload. Only file-change events from the watcher trigger Reloads.
+
+### 13.3 To Future Implementors
+
+Any program that claims conformance with this specification must:
+
+1. Implement all states in §5 and all transitions in §5.2.
+2. Prohibit all transitions not listed in §5.2.
+3. Implement SCC decomposition and ReloadSet computation as defined in §6–§7.
+4. Emit all Sigs defined in this document at the defined points.
+5. Implement supersession as defined in §9.
+6. Classify all errors per §10.
+7. Satisfy all invariants in §12 for every Reload.
+
+---
+
+## 14. Anti-Goals
+
+The following are **explicitly not goals** of hot.js and will never be added:
+
+| Anti-Goal | Reason |
+|---|---|
+| Lifecycle hooks | Nondeterminism vector. See §2. |
+| Plugin system | Nondeterminism vector. Expands the attack surface for entropy. |
+| State preservation across reloads | Requires opinion about state shape. Violates §12.8. |
+| Bundler integration | hot.js operates below the bundler layer. |
+| HMR protocol compatibility | HMR is a framework-level concern. hot.js is substrate-level. |
+| Automatic retry on failure | Introduces hidden temporal coupling and state. |
+| Conditional reload (filter/ignore patterns beyond config) | Adds decision points inside the pipeline. All filtering is in Config, read once. |
+| User-defined evaluation order | Topological order is the only correct order. |
+
+---
+
+## 15. Versioning
+
+### 15.1 Pre-Stability Notice
+
+This specification uses **v0.x.y** versioning per Semantic Versioning 2.0.0. The `0.x` major version signals that no consumer contract is yet in effect. All sections are normative for the reference implementation, but the spec may change freely between minor versions until v1.0.0 is minted alongside a stable MVP.
+
+### 15.2 Version Semantics (v0.x)
+
+- **Minor (0.x.0):** Any change — additive, breaking, structural, doctrinal.
+- **Patch (0.x.y):** Clarifications, typo fixes, and editorial changes with no behavioral impact.
+
+### 15.3 Promotion to v1.0.0
+
+v1.0.0 will be minted when:
+
+1. A conformant implementation exists and passes its own test suite.
+2. All three integration modes (§11) are implemented and exercised.
+3. The spec has survived at least one full design-build-test cycle without structural revision.
+
+At that point, standard SemVer rules apply (major = breaking, minor = additive, patch = editorial).
+
+### 15.4 Changelog
+
+| Version | Date | Description |
+|---|---|---|
+| 0.1.0 | 2026-04-22 | Initial specification under hookless substrate doctrine. SCC semantics, ReloadSet computation, supersession, error model, integration modes, and invariants fully specified. |
+
+---
+
+*End of specification.*
