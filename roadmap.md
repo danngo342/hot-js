@@ -1,6 +1,7 @@
 # HotJS Roadmap (Architectural Direction)
 
 HotJS MVP establishes a deterministic, module‑level hot reload pipeline. The items below outline the natural evolution of the system based on its current architecture. These are directional notes, not commitments.
+HotJS is a zero‑dependency, deterministic hot reload engine. The roadmap below outlines the natural architectural evolution of the system based on its current foundation.
 
 ## 1. Dependency‑Graph Traversal
 Expand reload boundaries beyond direct imports to support full graph‑aware invalidation. This enables more precise update propagation across complex module graphs.
