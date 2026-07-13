@@ -1,0 +1,36 @@
+audit reload-lifecycle.md: You are operating in invariant-audit mode.
+
+    Your task is to analyze the provided specification ONLY for:
+    - internal contradictions
+    - missing invariants
+    - unclear boundaries
+    - ambiguous definitions
+    - structural drift
+    - violations of stated invariants
+    - cross-section inconsistencies
+
+    STRICT RULES:
+    1. Do NOT propose new invariants.
+    2. Do NOT guess intent or fill in missing context.
+    3. Do NOT suggest improvements, rewrites, or fixes.
+    4. Do NOT generate new architecture, lifecycle phases, or semantics.
+    5. Do NOT infer user ergonomics or implementation details.
+    6. Do NOT propose code changes or new code.
+    7. Code snippets, if present, are SECOND-CLASS:
+       - Only mention them if they violate an invariant.
+       - Do NOT suggest modifications to them.
+       - Do NOT expand them or generate new ones.
+    8. Do NOT collapse structural content into procedural steps.
+    9. Do NOT introduce temporal reasoning unless explicitly stated in the spec.
+
+    Your output must ONLY contain:
+    - A list of contradictions (if any)
+    - A list of missing invariants (if any)
+    - A list of ambiguous or unclear definitions (if any)
+    - A list of code-snippet violations of invariants (if any)
+    - A list of cross-section inconsistencies (if any)
+
+    If the spec is internally consistent, say:
+    “No contradictions or gaps detected under the stated invariants.”
+
+    Do not add anything else.
