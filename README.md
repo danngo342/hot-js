@@ -1,16 +1,16 @@
 # hot.js
 
-A minimal, deterministic hot‑reload runtime.  
-hot.js focuses on correctness, predictable lifecycle transitions, and
-structured restart semantics rather than feature accumulation.
+A zero‑dependency, deterministic hot‑reload runtime.  
+HotJS focuses on correctness, predictable lifecycle transitions, and
+structured reload semantics rather than feature accumulation.
 
 ## Features
 
-- Deterministic process lifecycle (single active child process)
-- Structured restart reasons (`file-change`, `rename`, `unknown`)
-- Clean watcher with consistent ignore rules
-- Substrate for dependency‑graph–aware reloads
-- Small enough to understand, extend, and reason about
+- **Deterministic lifecycle** — single active child process with clean termination and restart.
+- **Typed reload reasons** — consistent restart causes (`file-change`, `rename`, `unknown`).
+- **Stable watcher** — strict ignore rules and predictable file‑system behavior.
+- **Graph‑ready substrate** — current module‑level reload pipeline forms the foundation for future dependency‑graph–aware updates.
+- **Small surface area** — easy to understand, extend, and reason about.
 
 ## Usage
 
@@ -18,14 +18,14 @@ structured restart semantics rather than feature accumulation.
 npx hot ./src/index.js
 ```
 
-hot.js watches the directory of the entry file, applies ignore rules,
+HotJS watches the directory of the entry file, applies ignore rules,
 computes a typed restart reason, and restarts the child process with a
 stable lifecycle envelope.
 
 ## Design Principles
 
 - **Determinism over convenience**  
-  Every restart is intentional, typed, and serialized.
+  Every reload is intentional, typed, and serialized.
 
 - **Minimal surface area**  
   The runtime is deliberately small to keep behavior transparent.
@@ -34,15 +34,12 @@ stable lifecycle envelope.
   Child processes are cleanly terminated and replaced; no overlap, no drift.
 
 - **Extensible substrate**  
-  The graph layer provides a foundation for future reload strategies.
+  The current architecture provides a foundation for more granular, graph‑aware reload strategies.
 
 ## Roadmap
 
-- Dependency graph–aware restarts  
-- Module‑level reload semantics  
-- Integration with semantic runtime envelopes  
+See **[roadmap.md](roadmap.md)** for architectural direction and planned evolution.
 
 ## License
 
 MIT
-
